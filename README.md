@@ -191,6 +191,25 @@ The AGX firmware needs ~10s of sustained GPU load to converge on low caps.
 The settled-frequency and power columns are self-consistent (they come from the
 firmware); only the GFLOPS column is suspect.
 
+**M2 Max 30-core (Mac14,5, `AGXAcceleratorG14X`)** — measured 2026-09-12, 10 s
+burn-in per level, AGX path confirmed at every level (no CLPC fallback):
+
+| Cap | GFLOPS | Filtered Power |
+|-----|--------|----------------|
+| 20W | 937.6 | 20,536 mW |
+| 15W | 787.4 | 15,019 mW |
+| 10W | 585.1 | 10,243 mW |
+| 5W | 317.8 | 5,018 mW |
+| 3W | 188.8 | 3,006 mW |
+| 2W | 113.8 | 1,965 mW |
+| 1W | 103.5 | 1,857 mW |
+| uncapped | **1214.8** | — |
+
+`FilteredGPUPower` tracks each cap to within ~2–4% down to 2 W. The 1 W setting is
+unreachable — the measured floor is about 1.86 W, which is why 1 W and 2 W land
+within 10% of each other. Uncapped reference points on the same machine: tiled FP32
+matmul 1179 GFLOPS @4096², fp32 simdgroup MMA 2222 GFLOPS @4096².
+
 ---
 
 ## Compatibility
@@ -198,7 +217,7 @@ firmware); only the GFLOPS column is suspect.
 | SoC | AGX class | AGX power cap | CLPC fallback | Status |
 |-----|-----------|---------------|---------------|--------|
 | M1 | AGXAcceleratorG13G | Should work | Yes | Untested |
-| M2 Max (Mac14,5) | **AGXAcceleratorG14X** | Should work | Yes | Class observed; cap path untested |
+| **M2 Max (Mac14,5)** | **AGXAcceleratorG14X** | **Yes** | Yes | **Verified** (30-core, 79,928 mW ceiling) |
 | M2 base / Pro | unknown (G15G reported upstream) | ? | Yes | Untested |
 | M3 | AGXAcceleratorG15X | Should work | Yes | Untested |
 | **M4** | **AGXAcceleratorG16G** | **Yes** | **Yes** | **Verified** |
@@ -268,10 +287,13 @@ experiments/            IOKit probes from the reverse engineering process
 
 ## Fixes in this working copy (not yet upstream)
 
-Six defects, each reproduced before the fix and re-verified after it. Rebuild the
+Eight defects, each reproduced before the fix and re-verified after it. Rebuild the
 tool and the benches to pick them up (`xcrun clang ... -o gpu_freq_ctl gpu_freq_ctl.m`,
 same for each bench). Fix 6 was found by the strengthened check in fix 1, on its
-first run — which is the argument for the check in the first place.
+first run — which is the argument for the check in the first place. Fixes 7 and 8
+were found by running the cap/sweep path on a real machine: a full sweep left the
+GPU capped at 2 W instead of the original 79.9 W, and a later `uncap` with no saved
+state would have forced it to 20 W.
 
 | # | File | Defect | Fix |
 |---|------|--------|-----|
@@ -281,6 +303,8 @@ first run — which is the argument for the check in the first place.
 | 4 | `gpu_freq_ctl.m` | `info` printed the range as `ps[1]`..`ps[n-1]`. The table is grouped into voltage corners, so that showed 444–968 MHz / 625–721 mV instead of 444–1398 MHz / 625–925 mV | Min/max over operating states, plus a corner count from idle-separated runs |
 | 5 | `gpu_freq_ctl.m` | `sweep` used `sleep(2)` between capping and measuring, contradicting the 10 s burn-in the README documents — the low caps converge last, which is exactly where a sweep needs convergence | A shared `burn_in_gpu()` used by both `cap` and `sweep` (still skippable with `--no-burn`) |
 | 6 | `matmul_dvfs_bench.m` | The tiled kernel returned early for out-of-range threads *before* its two `threadgroup_barrier` calls, and dispatched with `dispatchThreads`, so partial threadgroups left shared-tile slots unwritten: at 100×100 the result was wrong (C[96] = 33.4 instead of 100) while every cell still looked "computed". All the sizes in the shipped sweep are multiples of 32, which is why it went unnoticed; the 100² case in fix 1 caught it immediately. | Removed the early return (bounds are handled by the zero-padded tile loads and a guarded store) and switched both dispatches to `dispatchThreadgroups` on a rounded-up grid, so every threadgroup is full and every barrier is reached by all threads. Peak reading moved 1223 → 1179 GFLOPS, which is the honest number |
+| 7 | `gpu_freq_ctl.m` | `cap` re-saved the "original" power cap on **every** invocation, so the saved value was always the *previous* cap. A `sweep` ending on `cap 1` therefore left the GPU at 2 W after `uncap` — the true 79,928 mW ceiling was gone. | The original is saved once and kept: `cap` only writes the state file when none exists, and says so on later calls |
+| 8 | `gpu_freq_ctl.m` | `uncap` with no saved state (or a corrupt one) **invented** a 20,000 mW cap and applied it. On a machine whose ceiling is 79.9 W that is a silent 4× throttling, and it also fabricated a cap that never existed on the machine. | Nothing is invented: it reports that there is no saved state, leaves the current cap untouched and tells you to pass an explicit value if you want it changed. The corrupt-state branch likewise stops writing anything |
 
 Cosmetic: the `Voltage corners:` section printed a bare header whenever no two
 adjacent states share a GPU voltage (the case on M2 Max). It now says so.

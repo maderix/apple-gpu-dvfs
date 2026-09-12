@@ -533,12 +533,20 @@ static void cmd_cap(double watts) {
     int use_agx = agx_available();
 
     if (use_agx) {
-        // AGX path — save original, set new cap
+        // AGX path — save the original cap ONCE, then set the new cap
         int64_t orig_mw = agx_get_max_power();
-        AGXSavedState ss = { .magic = STATE_MAGIC_AGX, .agx_max_power = orig_mw };
-        FILE *f = fopen(STATEFILE, "wb");
-        if (f) { fwrite(&ss, sizeof(ss), 1, f); fclose(f); }
-        LOG_OK("Saved original GPU power cap: %lld mW (%.1f W)", orig_mw, orig_mw / 1000.0);
+        if (access(STATEFILE, F_OK) != 0) {
+            AGXSavedState ss = { .magic = STATE_MAGIC_AGX, .agx_max_power = orig_mw };
+            FILE *f = fopen(STATEFILE, "wb");
+            if (f) { fwrite(&ss, sizeof(ss), 1, f); fclose(f); }
+            LOG_OK("Saved original GPU power cap: %lld mW (%.1f W)", orig_mw, orig_mw / 1000.0);
+        } else {
+            // Re-saving on every call made a multi-level sequence restore the
+            // previous level instead of the original: a sweep ending on `cap 1`
+            // left the GPU at 2 W after `uncap`, because the 1 W step had
+            // re-saved 2 W as "original".
+            LOG_INFO("Original cap already saved — keeping it (uncap restores that value)");
+        }
 
         LOG_INFO("Setting GPU power cap to %lld mW (%.1f W) via AGX...", mw, watts);
         kern_return_t kr = agx_set_power(mw);
@@ -562,10 +570,16 @@ clpc_fallback:
     LOG_WARN("AGX path unavailable, using CLPC fallback (system-wide, has PID lag)");
 
     CLPCState orig = clpc_read_state();
-    CLPCSavedState css = { .magic = STATE_MAGIC_CLPC, .clpc = orig };
-    FILE *f = fopen(STATEFILE, "wb");
-    if (f) { fwrite(&css, sizeof(css), 1, f); fclose(f); }
-    LOG_OK("Saved CLPC state");
+    // Same rule as the AGX path: the first saved state wins, so a sequence of
+    // caps still restores the pre-first-cap state.
+    if (access(STATEFILE, F_OK) != 0) {
+        CLPCSavedState css = { .magic = STATE_MAGIC_CLPC, .clpc = orig };
+        FILE *f = fopen(STATEFILE, "wb");
+        if (f) { fwrite(&css, sizeof(css), 1, f); fclose(f); }
+        LOG_OK("Saved CLPC state");
+    } else {
+        LOG_INFO("CLPC state already saved — keeping it (uncap restores that state)");
+    }
 
     int64_t raw = (int64_t)(watts * 1048576.0);
     LOG_INFO("Setting CLPC power cap to %.1f W...", watts);
@@ -586,11 +600,16 @@ clpc_fallback:
 static void cmd_uncap(void) {
     FILE *f = fopen(STATEFILE, "rb");
     if (!f) {
-        // No saved state — try AGX restore to a safe default
-        LOG_WARN("No saved state found");
+        // No saved state — report and leave the cap alone
+        LOG_WARN("No saved state found — nothing to restore");
         if (agx_available()) {
-            LOG_INFO("Restoring AGX MaxGPUAbsolutePower to 20000 mW (default)...");
-            agx_set_power(20000);
+            // Never invent a cap. The old behaviour forced 20000 mW here, which
+            // silently throttled a machine whose real ceiling is far higher
+            // (79,928 mW on an M2 Max) whenever the state file was missing.
+            int64_t cur = agx_get_max_power();
+            LOG_INFO("Leaving the current GPU power cap untouched (%lld mW / %.1f W). "
+                     "Pass an explicit value ('cap 79.9') if you want it changed.",
+                     cur, cur / 1000.0);
         }
         goto measure;
     }
@@ -620,9 +639,8 @@ static void cmd_uncap(void) {
         sleep(5);
     } else {
         fclose(f);
-        LOG_ERR("Corrupt state file — removing");
+        LOG_ERR("Corrupt state file — removing it; GPU power cap left untouched");
         unlink(STATEFILE);
-        if (agx_available()) agx_set_power(20000);
     }
 
 measure:;
