@@ -37,8 +37,7 @@ static NSString *matmulShader = @
 "{\n"
 "    uint row = gid.y;\n"
 "    uint col = gid.x;\n"
-"    if (row >= M || col >= N) return;\n"
-"\n"
+"    /* bounds handled by zero-padded loads + a guarded store */\n"
 "    threadgroup float As[TILE][TILE];\n"
 "    threadgroup float Bs[TILE][TILE];\n"
 "\n"
@@ -58,7 +57,7 @@ static NSString *matmulShader = @
 "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 "    }\n"
 "\n"
-"    C[row * N + col] = acc;\n"
+"    if (row < M && col < N) C[row * N + col] = acc;\n"
 "}\n";
 
 static double mach_to_ms(uint64_t elapsed) {
@@ -156,7 +155,7 @@ int main(int argc, char **argv) {
         int warmup = dim <= 256 ? 10 : (dim <= 1024 ? 5 : 2);
         int timed = dim <= 256 ? 20 : (dim <= 1024 ? 10 : 5);
 
-        MTLSize grid = MTLSizeMake(N, M, 1);
+        MTLSize grid = MTLSizeMake((N + 15) / 16, (M + 15) / 16, 1);  // threadgroup grid: every group is full
         MTLSize tg = MTLSizeMake(16, 16, 1);
 
         // Warmup
@@ -171,7 +170,7 @@ int main(int argc, char **argv) {
                 [enc setBuffer:bufM offset:0 atIndex:3];
                 [enc setBuffer:bufN offset:0 atIndex:4];
                 [enc setBuffer:bufK offset:0 atIndex:5];
-                [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+                [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
                 [enc endEncoding];
                 [cmd commit];
                 [cmd waitUntilCompleted];
@@ -191,7 +190,7 @@ int main(int argc, char **argv) {
                 [enc setBuffer:bufM offset:0 atIndex:3];
                 [enc setBuffer:bufN offset:0 atIndex:4];
                 [enc setBuffer:bufK offset:0 atIndex:5];
-                [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+                [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
                 [enc endEncoding];
                 [cmd commit];
                 [cmd waitUntilCompleted];
@@ -218,9 +217,13 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
 
-    // Correctness check on last result
+    // Correctness: ones-matrices at a whole-tile size and a tile-boundary size.
+    // C is zeroed first so an unwritten cell fails loudly instead of depending on
+    // whatever the fresh buffer happened to contain.
     {
-        uint32_t dim = 64;
+        const uint32_t csizes[] = {64, 100};
+        for (int ci = 0; ci < 2; ci++) {
+        uint32_t dim = csizes[ci];
         uint32_t M = dim, N = dim, K = dim;
         id<MTLBuffer> bufA = [dev newBufferWithLength:M*K*4 options:MTLResourceStorageModeShared];
         id<MTLBuffer> bufB = [dev newBufferWithLength:K*N*4 options:MTLResourceStorageModeShared];
@@ -233,6 +236,7 @@ int main(int argc, char **argv) {
         float *pB = (float *)[bufB contents];
         for (uint32_t i = 0; i < M*K; i++) pA[i] = 1.0f;
         for (uint32_t i = 0; i < K*N; i++) pB[i] = 1.0f;
+        memset([bufC contents], 0, M*N*4);
 
         @autoreleasepool {
             id<MTLCommandBuffer> cmd = [queue commandBuffer];
@@ -244,7 +248,7 @@ int main(int argc, char **argv) {
             [enc setBuffer:bufM offset:0 atIndex:3];
             [enc setBuffer:bufN offset:0 atIndex:4];
             [enc setBuffer:bufK offset:0 atIndex:5];
-            [enc dispatchThreads:MTLSizeMake(N,M,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
+            [enc dispatchThreadgroups:MTLSizeMake((N+15)/16,(M+15)/16,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];
             [enc endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
@@ -252,13 +256,17 @@ int main(int argc, char **argv) {
 
         float *pC = (float *)[bufC contents];
         float expected = (float)K;
-        int ok = 1;
-        for (uint32_t i = 0; i < M*N && ok; i++) {
-            if (fabsf(pC[i] - expected) > 0.01f) ok = 0;
+        int bad = 0; uint32_t bad_i = 0, computed = 0; float bad_v = 0.0f;
+        for (uint32_t i = 0; i < M*N; i++) {
+            if (pC[i] != 0.0f) computed++;
+            if (fabsf(pC[i] - expected) > 0.01f && !bad) { bad = 1; bad_i = i; bad_v = pC[i]; }
         }
         if (!csv_mode) {
-            printf("\nCorrectness (64×64, ones): %s (C[0]=%.1f, expected=%.1f)\n",
-                   ok ? "PASS" : "FAIL", pC[0], expected);
+            printf("\nCorrectness (%u×%u, ones): %s — %u/%u cells computed\n",
+                   M, N, bad ? "FAIL" : "PASS", computed, M*N);
+            if (bad)
+                printf("  first mismatch: C[%u] = %.3f (expected %.1f)\n", bad_i, bad_v, expected);
+        }
         }
     }
 
