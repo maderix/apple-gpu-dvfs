@@ -210,6 +210,21 @@ unreachable — the measured floor is about 1.86 W, which is why 1 W and 2 W lan
 within 10% of each other. Uncapped reference points on the same machine: tiled FP32
 matmul 1179 GFLOPS @4096², fp32 simdgroup MMA 2222 GFLOPS @4096².
 
+### Reproducing a sweep
+
+`sweep-10s.sh` drives the same methodology across power levels and writes a table
+plus a raw transcript (`~/gpu-dvfs-sweep.txt` and `.raw`), restoring the original
+cap on exit, on Ctrl-C, or on error:
+
+```sh
+sudo bash sweep-10s.sh                  # 20 15 10 5 3 2 1 W by default
+sudo CAPS="20 10 5" bash sweep-10s.sh   # subset, quicker
+```
+
+Each line is `cap N --confirm` (10 s burn-in plus a powermetrics frequency read)
+followed by `status`, so budget roughly 10 s per level. It needs the built
+`gpu_freq_ctl`, fails fast if it is missing, and warns when not run as root.
+
 ---
 
 ## Compatibility
