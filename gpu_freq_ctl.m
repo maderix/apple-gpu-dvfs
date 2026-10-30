@@ -364,6 +364,24 @@ static double measure_gflops(void) {
     return 2.0 * N * N * N / (best * 1e6);
 }
 
+// Sustained-load burn-in: the AGX firmware only converges on a low power cap
+// after several seconds of real GPU work. `cap` and `sweep` both use this so
+// their numbers come from the same methodology (skip with --no-burn).
+static void burn_in_gpu(double seconds) {
+    if (g_no_burn) return;
+    LOG_INFO("Burning in GPU for %.0fs (AGX firmware needs sustained load to converge)...", seconds);
+    fflush(stdout);
+    mach_timebase_info_data_t tbi;
+    mach_timebase_info(&tbi);
+    uint64_t t0 = mach_absolute_time();
+    uint64_t limit_ns = (uint64_t)(seconds * 1e9);
+    while (1) {
+        uint64_t ns = (mach_absolute_time() - t0) * tbi.numer / tbi.denom;
+        if (ns > limit_ns) break;
+        measure_gflops();
+    }
+}
+
 // ─── Powermetrics confirmation ──────────────────────────────────────────────
 
 static void confirm_frequency(void) {
@@ -391,6 +409,11 @@ static void confirm_frequency(void) {
 
 typedef struct { uint32_t freq_mhz; uint32_t voltage_mv; uint32_t sram_mv; } PState;
 
+// The device tree lays the table out as voltage corners (M2 Max: 4 corners x 9
+// states = 36 entries). The buffer must exceed any known table, or the top
+// states silently disappear and every consumer reads a truncated table.
+#define DVFS_MAX_STATES 64
+
 static int read_dvfs_table(PState *out, int max_entries) {
     io_iterator_t iter;
     kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault,
@@ -410,7 +433,11 @@ static int read_dvfs_table(PState *out, int max_entries) {
         const uint8_t *bytes = CFDataGetBytePtr(ps_data);
         const uint8_t *sram_bytes = sram_data ? CFDataGetBytePtr(sram_data) : NULL;
         count = (int)(len / 8);
-        if (count > max_entries) count = max_entries;
+        if (count > max_entries) {
+            fprintf(stderr, "  warning: device tree exposes %d P-states, buffer holds %d"
+                            " — raise DVFS_MAX_STATES\n", count, max_entries);
+            count = max_entries;
+        }
         for (int i = 0; i < count; i++) {
             uint32_t freq, mv, smv = 0;
             memcpy(&freq, bytes + i * 8, 4);
@@ -442,12 +469,26 @@ static void cmd_info(void) {
     if (max_mw >= 0)
         printf("  GPU power:    %lld mW (MaxGPUAbsolutePower)\n", max_mw);
 
-    PState ps[32];
-    int n = read_dvfs_table(ps, 32);
+    PState ps[DVFS_MAX_STATES];
+    int n = read_dvfs_table(ps, DVFS_MAX_STATES);
     if (n > 0) {
         printf("  P-states:     %d\n", n);
-        printf("  Freq range:   %u – %u MHz\n", ps[1].freq_mhz, ps[n-1].freq_mhz);
-        printf("  Voltage:      %u – %u mV\n", ps[1].voltage_mv, ps[n-1].voltage_mv);
+        // Min/max over operating states. The table is grouped into voltage
+        // corners, so ps[n-1] is not the highest state — reading ps[1]/ps[n-1]
+        // under-reported the range (444–968 MHz instead of 444–1398 on M2 Max).
+        uint32_t fmin = 0, fmax = 0, vmin = 0, vmax = 0;
+        int corners = 0, in_corner = 0;
+        for (int i = 0; i < n; i++) {
+            if (ps[i].freq_mhz == 0) { in_corner = 0; continue; }   // idle ends a corner
+            if (!in_corner) { corners++; in_corner = 1; }
+            if (fmin == 0 || ps[i].freq_mhz < fmin) fmin = ps[i].freq_mhz;
+            if (ps[i].freq_mhz > fmax) fmax = ps[i].freq_mhz;
+            if (vmin == 0 || ps[i].voltage_mv < vmin) vmin = ps[i].voltage_mv;
+            if (ps[i].voltage_mv > vmax) vmax = ps[i].voltage_mv;
+        }
+        printf("  Freq range:   %u – %u MHz (operating states)\n", fmin, fmax);
+        printf("  Voltage:      %u – %u mV over %d voltage corner%s\n",
+               vmin, vmax, corners, corners == 1 ? "" : "s");
     }
 }
 
@@ -492,12 +533,20 @@ static void cmd_cap(double watts) {
     int use_agx = agx_available();
 
     if (use_agx) {
-        // AGX path — save original, set new cap
+        // AGX path — save the original cap ONCE, then set the new cap
         int64_t orig_mw = agx_get_max_power();
-        AGXSavedState ss = { .magic = STATE_MAGIC_AGX, .agx_max_power = orig_mw };
-        FILE *f = fopen(STATEFILE, "wb");
-        if (f) { fwrite(&ss, sizeof(ss), 1, f); fclose(f); }
-        LOG_OK("Saved original GPU power cap: %lld mW (%.1f W)", orig_mw, orig_mw / 1000.0);
+        if (access(STATEFILE, F_OK) != 0) {
+            AGXSavedState ss = { .magic = STATE_MAGIC_AGX, .agx_max_power = orig_mw };
+            FILE *f = fopen(STATEFILE, "wb");
+            if (f) { fwrite(&ss, sizeof(ss), 1, f); fclose(f); }
+            LOG_OK("Saved original GPU power cap: %lld mW (%.1f W)", orig_mw, orig_mw / 1000.0);
+        } else {
+            // Re-saving on every call made a multi-level sequence restore the
+            // previous level instead of the original: a sweep ending on `cap 1`
+            // left the GPU at 2 W after `uncap`, because the 1 W step had
+            // re-saved 2 W as "original".
+            LOG_INFO("Original cap already saved — keeping it (uncap restores that value)");
+        }
 
         LOG_INFO("Setting GPU power cap to %lld mW (%.1f W) via AGX...", mw, watts);
         kern_return_t kr = agx_set_power(mw);
@@ -506,18 +555,7 @@ static void cmd_cap(double watts) {
             goto clpc_fallback;
         }
 
-        if (!g_no_burn) {
-            LOG_INFO("Burning in GPU for 10s (AGX firmware needs sustained load to converge)...");
-            fflush(stdout);
-            mach_timebase_info_data_t tbi;
-            mach_timebase_info(&tbi);
-            uint64_t t0 = mach_absolute_time();
-            while (1) {
-                uint64_t ns = (mach_absolute_time() - t0) * tbi.numer / tbi.denom;
-                if (ns > 10000000000ULL) break;
-                measure_gflops();
-            }
-        }
+        burn_in_gpu(10.0);
 
         double gf = measure_gflops();
         int64_t actual = agx_get_filtered_power();
@@ -532,10 +570,16 @@ clpc_fallback:
     LOG_WARN("AGX path unavailable, using CLPC fallback (system-wide, has PID lag)");
 
     CLPCState orig = clpc_read_state();
-    CLPCSavedState css = { .magic = STATE_MAGIC_CLPC, .clpc = orig };
-    FILE *f = fopen(STATEFILE, "wb");
-    if (f) { fwrite(&css, sizeof(css), 1, f); fclose(f); }
-    LOG_OK("Saved CLPC state");
+    // Same rule as the AGX path: the first saved state wins, so a sequence of
+    // caps still restores the pre-first-cap state.
+    if (access(STATEFILE, F_OK) != 0) {
+        CLPCSavedState css = { .magic = STATE_MAGIC_CLPC, .clpc = orig };
+        FILE *f = fopen(STATEFILE, "wb");
+        if (f) { fwrite(&css, sizeof(css), 1, f); fclose(f); }
+        LOG_OK("Saved CLPC state");
+    } else {
+        LOG_INFO("CLPC state already saved — keeping it (uncap restores that state)");
+    }
 
     int64_t raw = (int64_t)(watts * 1048576.0);
     LOG_INFO("Setting CLPC power cap to %.1f W...", watts);
@@ -544,17 +588,7 @@ clpc_fallback:
     clpc_set("`pkg-low-power-target", raw);
     if (watts < 5.0) clpc_set("~pkg-power-zone-target-0", raw * 2);
 
-    if (!g_no_burn) {
-        LOG_INFO("Burning in GPU for 10s to trigger CLPC response...");
-        fflush(stdout);
-        uint64_t start = mach_absolute_time();
-        mach_timebase_info_data_t tbi; mach_timebase_info(&tbi);
-        while (1) {
-            uint64_t ns = (mach_absolute_time() - start) * tbi.numer / tbi.denom;
-            if (ns > 10000000000ULL) break;
-            measure_gflops();
-        }
-    }
+    burn_in_gpu(10.0);
 
     double gf = measure_gflops();
     LOG_OK("GPU throttled: %.1f GFLOPS (CLPC cap %.1f W)", gf, watts);
@@ -566,11 +600,16 @@ clpc_fallback:
 static void cmd_uncap(void) {
     FILE *f = fopen(STATEFILE, "rb");
     if (!f) {
-        // No saved state — try AGX restore to a safe default
-        LOG_WARN("No saved state found");
+        // No saved state — report and leave the cap alone
+        LOG_WARN("No saved state found — nothing to restore");
         if (agx_available()) {
-            LOG_INFO("Restoring AGX MaxGPUAbsolutePower to 20000 mW (default)...");
-            agx_set_power(20000);
+            // Never invent a cap. The old behaviour forced 20000 mW here, which
+            // silently throttled a machine whose real ceiling is far higher
+            // (79,928 mW on an M2 Max) whenever the state file was missing.
+            int64_t cur = agx_get_max_power();
+            LOG_INFO("Leaving the current GPU power cap untouched (%lld mW / %.1f W). "
+                     "Pass an explicit value ('cap 79.9') if you want it changed.",
+                     cur, cur / 1000.0);
         }
         goto measure;
     }
@@ -600,9 +639,8 @@ static void cmd_uncap(void) {
         sleep(5);
     } else {
         fclose(f);
-        LOG_ERR("Corrupt state file — removing");
+        LOG_ERR("Corrupt state file — removing it; GPU power cap left untouched");
         unlink(STATEFILE);
-        if (agx_available()) agx_set_power(20000);
     }
 
 measure:;
@@ -638,18 +676,17 @@ static void cmd_sweep(void) {
         int64_t mw = (int64_t)(caps_w[i] * 1000);
         if (use_agx) {
             agx_set_power(mw);
-            sleep(2);
-            measure_gflops();
+            // Same methodology as `cap`. The old sleep(2) left the low caps
+            // (<= 2 W) unconverged, which is the opposite of what a sweep is for.
+            burn_in_gpu(10.0);
         } else {
             clpc_write_state(&orig_clpc);
-            sleep(3);
             int64_t raw = (int64_t)(caps_w[i] * 1048576.0);
             clpc_set("~pkg-avg-max-power", raw);
             clpc_set("~pkg-lowpeak-max-power", raw);
             clpc_set("`pkg-low-power-target", raw);
             if (caps_w[i] < 5.0) clpc_set("~pkg-power-zone-target-0", raw * 2);
-            for (int b = 0; b < 3; b++) measure_gflops();
-            sleep(2);
+            burn_in_gpu(10.0);   // CLPC's PID needs the sustained load even more
         }
 
         double gf = measure_gflops();
@@ -675,8 +712,8 @@ static void cmd_sweep(void) {
 
 static void cmd_table(void) {
     SoCInfo soc = detect_soc();
-    PState ps[32];
-    int count = read_dvfs_table(ps, 32);
+    PState ps[DVFS_MAX_STATES];
+    int count = read_dvfs_table(ps, DVFS_MAX_STATES);
     if (count == 0) { LOG_ERR("Could not read DVFS table from device tree"); return; }
 
     printf("%s── GPU DVFS Table (%s, %d P-states) ──%s\n\n",
@@ -728,12 +765,23 @@ static void cmd_table(void) {
         prev_v = ps[i].voltage_mv;
     }
 
-    printf("\n  %sVoltage corners:%s\n", g_color ? C_BOLD : "", g_color ? C_RESET : "");
-    for (int i = 1; i < count - 1; i++) {
-        if (i + 1 < count && ps[i].voltage_mv == ps[i+1].voltage_mv && ps[i].voltage_mv > 0)
-            printf("    %4u mV: %u ↔ %u MHz (Δ%d)\n",
-                   ps[i].voltage_mv, ps[i].freq_mhz, ps[i+1].freq_mhz,
-                   (int)ps[i+1].freq_mhz - (int)ps[i].freq_mhz);
+    int corner_pairs = 0;
+    for (int i = 1; i < count - 1; i++)
+        if (i + 1 < count && ps[i].voltage_mv == ps[i+1].voltage_mv && ps[i].voltage_mv > 0) corner_pairs++;
+    if (corner_pairs > 0) {
+        printf("\n  %sVoltage corners:%s\n", g_color ? C_BOLD : "", g_color ? C_RESET : "");
+        for (int i = 1; i < count - 1; i++) {
+            if (i + 1 < count && ps[i].voltage_mv == ps[i+1].voltage_mv && ps[i].voltage_mv > 0)
+                printf("    %4u mV: %u ↔ %u MHz (Δ%d)\n",
+                       ps[i].voltage_mv, ps[i].freq_mhz, ps[i+1].freq_mhz,
+                       (int)ps[i+1].freq_mhz - (int)ps[i].freq_mhz);
+        }
+    } else {
+        // M2 Max and relatives ramp GPU mV at every step; an empty list under a
+        // printed header reads as a bug, so say what is actually going on.
+        printf("\n  %sVoltage corners:%s none at equal GPU mV on this chip"
+               " — corner boundaries are visible in the SRAM column\n",
+               g_color ? C_BOLD : "", g_color ? C_RESET : "");
     }
 
     uint32_t sram_floor = 0;

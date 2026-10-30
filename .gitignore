@@ -1,0 +1,12 @@
+# Build artifacts — rebuild with the clang lines in README.md
+gpu_freq_ctl
+matmul_mma_bench
+matmul_dvfs_bench
+gpu_dvfs_bench
+gpu_dvfs_bench_v2
+*.o
+*.dSYM/
+
+# Local run output
+*.csv
+*sweep*.txt
